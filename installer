@@ -656,7 +656,7 @@ def parse_import_line(line, default_grp=""):
        2) Dan thang ket qua quet mang: IP <tab> 2 ms <tab> HOSTNAME  (Advanced IP Scanner, PingInfoView...)"""
     parts = [p.strip() for p in re.split(r"[,;\t]", line)]
     if len(parts) == 1:
-        parts = parts[0].split()          # "192.168.1.1   2 ms   HOST" cach bang khoang trang
+        parts = parts[0].split()          # "10.10.90.1   2 ms   HOST" cach bang khoang trang
         if len(parts) == 1:
             parts = [parts[0], parts[0]]
     # Kieu 2: cot dau la IP, cot 2 khong phai dia chi (vd "2 ms") -> lay hostname o cot sau
@@ -1101,11 +1101,8 @@ cat > 'app/index.html' <<'__PINGMON_EOF_2__'
   #selbar b { margin-right: 6px; }
   #selbar .sp { flex: 1; }
 
-  main { display: grid; grid-template-columns: minmax(0, 1fr) var(--log-w, 340px); gap: 16px; padding: 14px 20px 24px; align-items: start; }
-  body.nolog main { grid-template-columns: minmax(0, 1fr); }
-  body.nolog aside { display: none; }
-  @media (max-width: 1000px) { main { grid-template-columns: 1fr; } aside { position: static !important; max-height: 60vh !important; }
-    .resizer { display: none; } }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; padding: 14px 20px 24px; align-items: start; }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; } aside { position: static !important; max-height: 60vh !important; } }
 
   /* ---------- tiles ---------- */
   .group-title { grid-column: 1 / -1; color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase;
@@ -1143,9 +1140,8 @@ cat > 'app/index.html' <<'__PINGMON_EOF_2__'
   .spark i.f { background: var(--down); }
   .spark i.e { background: var(--line); }
   .t-msg { font-size: 12px; color: var(--down-text); margin-top: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .t-edit { flex: none; padding: 0 7px; font-size: 12px; line-height: 18px; font-weight: 600; opacity: .55; margin-top: 1px; }
+  .t-edit { position: absolute; bottom: 8px; right: 8px; padding: 2px 8px; font-size: 12px; opacity: 0; }
   .tile:hover .t-edit { opacity: 1; }
-  .t-edit:hover { border-color: var(--accent); color: var(--accent); }
   .selecting .t-edit { display: none; }
   .empty { grid-column: 1 / -1; text-align: center; color: var(--muted); padding: 50px 10px;
     border: 1px dashed var(--line); border-radius: var(--radius); }
@@ -1171,26 +1167,17 @@ cat > 'app/index.html' <<'__PINGMON_EOF_2__'
 
   /* ---------- events ---------- */
   aside { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); position: sticky; top: 70px;
-    max-height: calc(100vh - 90px); display: flex; flex-direction: column; --fs: var(--log-fs, 13px); }
-  aside h2 { font-size: 14px; margin: 0; padding: 8px 8px 8px 14px; border-bottom: 1px solid var(--line); display: flex; align-items: center;
-    gap: 4px; flex-wrap: wrap; white-space: nowrap; }
-  aside h2 .sp { flex: 1; }
-  aside h2 label { margin: 0; display: flex; align-items: center; gap: 5px; font-weight: 400; cursor: pointer; font-size: 12px; }
-  aside h2 button { padding: 1px 6px; font-size: 12px; line-height: 20px; }
-  .resizer { position: absolute; left: -11px; top: 0; bottom: 0; width: 10px; cursor: col-resize; z-index: 2; }
-  .resizer::after { content: ""; position: absolute; left: 4px; top: 50%; height: 44px; margin-top: -22px; width: 3px;
-    border-radius: 2px; background: var(--line); }
-  .resizer:hover::after, body.resizing .resizer::after { background: var(--accent); }
-  body.resizing { cursor: col-resize; user-select: none; }
+    max-height: calc(100vh - 90px); display: flex; flex-direction: column; }
+  aside h2 { font-size: 14px; margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 8px; }
+  aside h2 label { margin: 0 0 0 auto; display: flex; align-items: center; gap: 5px; font-weight: 400; cursor: pointer; }
   #events { overflow: auto; flex: 1; }
-  .ev { display: grid; grid-template-columns: calc(var(--fs) * 4.5) 1fr; gap: 8px; padding: 7px 14px; border-bottom: 1px solid var(--line);
-    font-size: var(--fs); }
-  .ev time { color: var(--muted); font-variant-numeric: tabular-nums; font-size: calc(var(--fs) - 1px); line-height: 1.3; }
-  .ev .k { font-weight: 700; font-size: calc(var(--fs) - 2px); letter-spacing: .03em; margin-right: 6px; }
+  .ev { display: grid; grid-template-columns: 58px 1fr; gap: 8px; padding: 7px 14px; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .ev time { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; line-height: 1.3; }
+  .ev .k { font-weight: 700; font-size: 11px; letter-spacing: .03em; margin-right: 6px; }
   .ev .k.down { color: var(--down); } .ev .k.up { color: var(--up); }
   .ev .k.other { color: var(--muted); }
   .ev .n { overflow-wrap: anywhere; }
-  .ev .d { color: var(--muted); font-size: calc(var(--fs) - 1px); overflow-wrap: anywhere; }
+  .ev .d { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
   .ev.new { animation: evnew 3s; }
   @keyframes evnew { from { background: var(--evnew); } }
 
@@ -1233,7 +1220,6 @@ cat > 'app/index.html' <<'__PINGMON_EOF_2__'
   #hist { position: fixed; z-index: 25; width: 400px; max-width: calc(100vw - 16px); max-height: min(560px, 80vh);
     background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 14px 36px var(--shadow);
     display: flex; flex-direction: column; overflow: hidden; }
-  #hist:not(.pinned) { pointer-events: none; }
   #hist .hh { padding: 12px 14px 10px; border-bottom: 1px solid var(--line); }
   #hist .hh .nm { font-size: 15px; font-weight: 700; overflow-wrap: anywhere; display: flex; gap: 8px; align-items: flex-start; }
   #hist .hh .nm .dot { margin-top: 6px; }
@@ -1306,7 +1292,6 @@ cat > 'app/index.html' <<'__PINGMON_EOF_2__'
     <option value="200">Ô nhỏ</option><option value="230">Ô vừa</option><option value="300">Ô rộng</option><option value="380">Ô rất rộng</option>
   </select>
   <span class="sp"></span>
-  <button id="btnLog" title="Ẩn / hiện khung nhật ký sự kiện">📋 Nhật ký</button>
   <button id="btnSelect" hidden>☑ Chọn nhiều</button>
   <button id="btnImport" hidden>Nhập danh sách</button>
   <button id="btnExport" hidden>Xuất CSV</button>
@@ -1329,15 +1314,7 @@ cat > 'app/index.html' <<'__PINGMON_EOF_2__'
 <main>
   <div id="grid"></div>
   <aside>
-    <div class="resizer" id="logResizer" title="Kéo để chỉnh độ rộng khung nhật ký (bấm đúp: về mặc định)"></div>
-    <h2>Nhật ký sự kiện <span class="sp"></span>
-      <button class="ghost" id="logSmaller" title="Chữ nhỏ hơn">A−</button>
-      <button class="ghost" id="logBigger" title="Chữ to hơn">A+</button>
-      <button class="ghost" id="logNarrow" title="Thu hẹp khung">Hẹp</button>
-      <button class="ghost" id="logWide" title="Mở rộng khung">Rộng</button>
-      <button class="ghost" id="logHide" title="Ẩn nhật ký">✕</button>
-    </h2>
-    <h2 style="padding-top:4px;padding-bottom:6px;border-bottom:1px solid var(--line)"><label><input type="checkbox" id="evOnlyState" checked> chỉ hiện mất / kết nối lại</label></h2>
+    <h2>Nhật ký sự kiện <label><input type="checkbox" id="evOnlyState" checked> chỉ mất/kết nối lại</label></h2>
     <div id="events"></div>
   </aside>
 </main>
@@ -1363,10 +1340,10 @@ cat > 'app/index.html' <<'__PINGMON_EOF_2__'
       <div><label>Nhóm</label><input name="grp" list="groups" placeholder="VD: Tầng 3" maxlength="60"></div>
     </div>
     <label id="lHost">Địa chỉ IP / tên máy</label>
-    <input name="host" placeholder="VD: 192.168.1.1">
+    <input name="host" placeholder="VD: 10.10.1.1">
     <div data-for="tcp dns"><label>Cổng</label><input name="port" type="number" min="1" max="65535" placeholder="VD: 3389"></div>
-    <div data-for="http"><label>URL</label><input name="target" data-t="http" placeholder="https://192.168.1.20/"></div>
-    <div data-for="dns"><label>Tên miền cần phân giải</label><input name="target" data-t="dns" placeholder="VD: example.local"></div>
+    <div data-for="http"><label>URL</label><input name="target" data-t="http" placeholder="https://10.10.1.5/"></div>
+    <div data-for="dns"><label>Tên miền cần phân giải</label><input name="target" data-t="dns" placeholder="VD: cpt.gov.vn"></div>
     <label>Ghi chú</label>
     <input name="note" maxlength="300" placeholder="Vị trí, người phụ trách…">
     <label class="check"><input type="checkbox" name="enabled" checked> Đang giám sát</label>
@@ -1385,13 +1362,13 @@ cat > 'app/index.html' <<'__PINGMON_EOF_2__'
   <form class="box wide" id="fImport">
     <h3>Nhập danh sách thiết bị</h3>
     <div class="hint">Mỗi dòng một thiết bị: <code>Tên, IP, Nhóm, Loại, Cổng/URL/Tên miền</code> — chỉ cần <code>Tên, IP</code> (mặc định Ping).<br>
-      Có thể dán thẳng từ Excel, hoặc <b>dán nguyên kết quả quét mạng</b> dạng <code>192.168.1.21  2 ms  SRV-APP-01</code> (tự lấy hostname làm tên).</div>
-    <textarea name="text" placeholder="Switch lõi, 192.168.1.2, Lõi mạng
-Firewall, 192.168.1.3, Lõi mạng
-Web nội bộ, 192.168.1.20, Máy chủ, http, https://192.168.1.20/
-Remote Desktop, 192.168.1.21, Máy chủ, tcp, 3389
-DNS nội bộ, 192.168.1.5, Máy chủ, dns, example.local
-192.168.1.50	2 ms	PRINTER-T1"></textarea>
+      Có thể dán thẳng từ Excel, hoặc <b>dán nguyên kết quả quét mạng</b> dạng <code>10.10.90.21  2 ms  TTBC-KT1-GATEWA</code> (tự lấy hostname làm tên).</div>
+    <textarea name="text" placeholder="Core Switch, 10.10.1.1, Lõi
+Firewall, 10.10.1.254, Lõi
+Web nội bộ, 10.10.90.10, Máy chủ, http, https://10.10.90.10/
+Remote Desktop, 10.10.90.20, Máy chủ, tcp, 3389
+DNS nội bộ, 10.10.90.2, Máy chủ, dns, cpt.gov.vn
+10.10.90.21	2 ms	TTBC-KT1-GATEWA"></textarea>
     <div class="row2">
       <div><label>Nhóm mặc định (cho dòng không ghi nhóm)</label><input name="grp" list="groups" maxlength="60"></div>
       <div></div>
@@ -1821,12 +1798,13 @@ DNS nội bộ, 192.168.1.5, Máy chủ, dns, example.local
                   d.status === "down" ? `từ ${fmtTime(d.since, false)}` : "";
       html += `<div class="tile ${cls}" data-id="${d.id}">
         <div class="t-head">${selecting ? `<input type="checkbox" tabindex="-1" ${picked.has(d.id) ? "checked" : ""}>` : '<span class="dot"></span>'}
-          <span class="t-name"><span data-hist="${d.id}">${esc(d.name)}</span></span><span class="badge">${TYPE_LABEL[d.type]}</span>${S.admin ? `<button class="t-edit" data-edit="${d.id}" title="Sửa thiết bị">✎</button>` : ""}</div>
+          <span class="t-name"><span data-hist="${d.id}">${esc(d.name)}</span></span><span class="badge">${TYPE_LABEL[d.type]}</span></div>
         <div class="t-host">${esc(devTarget(d))}${d.grp && !showGroups ? " · " + esc(d.grp) : ""}</div>
         <div class="t-row"><span class="t-state">${STATE_LABEL[d.status]}</span><span class="t-dur">${right}</span></div>
         <div class="t-row"><span class="t-dur">${sub}</span></div>
         <div class="spark">${spark}</div>
         ${d.status === "down" && d.msg ? `<div class="t-msg">${esc(d.msg)}</div>` : ""}
+        ${S.admin ? `<button class="t-edit" data-edit="${d.id}">Sửa</button>` : ""}
       </div>`;
     }
     return html;
@@ -1913,7 +1891,7 @@ DNS nội bộ, 192.168.1.5, Máy chủ, dns, example.local
     $("conn").textContent = isLost ? "Mất kết nối máy chủ" : "Trực tuyến";
     if (isLost && !lost) {
       lost = true;
-      toast("down", "Mất kết nối tới máy chủ giám sát", "Kiểm tra mạng hoặc máy chủ giám sát");
+      toast("down", "Mất kết nối tới máy chủ giám sát", "Kiểm tra mạng hoặc máy chủ awx");
       if (!soundOff && snd.down) enqueue(async () => { await playWarn(); await speak("Mất kết nối tới máy chủ giám sát"); });
     }
   }
@@ -2153,7 +2131,7 @@ DNS nội bộ, 192.168.1.5, Máy chủ, dns, example.local
   const histCache = {};
   let histId = null, histShowT = null, histHideT = null, histPinned = false, histRect = null;
   const H = $("hist");
-  function hideHist() { H.hidden = true; histId = null; histPinned = false; H.classList.remove("pinned"); }
+  function hideHist() { H.hidden = true; histId = null; histPinned = false; }
   function placeHist() {
     if (!histRect) return;
     const w = H.offsetWidth, h = H.offsetHeight, vw = innerWidth, vh = innerHeight;
@@ -2205,7 +2183,6 @@ DNS nội bộ, 192.168.1.5, Máy chủ, dns, example.local
       <div class="hl">${evs || '<div class="hempty">Chưa có sự kiện nào</div>'}</div>
       <div class="hf"><span>${h.events.length >= 60 ? "60 sự kiện gần nhất" : h.events.length + " sự kiện"}</span><span>${histPinned ? "Bấm ra ngoài / Esc để đóng" : "Bấm vào tên để ghim"}</span></div>`;
     if (keep) H.querySelector(".hl").scrollTop = keep;
-    H.classList.toggle("pinned", histPinned);
     H.hidden = false; placeHist();
   }
   document.addEventListener("mouseover", e => {
@@ -2217,18 +2194,18 @@ DNS nội bộ, 192.168.1.5, Máy chủ, dns, example.local
       if (histPinned || (id === histId && !H.hidden)) return;
       clearTimeout(histShowT);
       const rect = a.getBoundingClientRect();
-      histShowT = setTimeout(() => showHist(id, rect), 450);
+      histShowT = setTimeout(() => showHist(id, rect), 300);
       return;
     }
     clearTimeout(histShowT);
-    if (!H.hidden && !histPinned) { clearTimeout(histHideT); histHideT = setTimeout(hideHist, 150); }
+    if (!H.hidden && !histPinned) { clearTimeout(histHideT); histHideT = setTimeout(hideHist, 350); }
   });
   // bam vao ten: ghim o lich su (dung duoc tren dien thoai)
   document.addEventListener("mousedown", e => {
     if (e.target.closest("#hist")) return;
     const a = e.target.closest("[data-hist]");
     if (a && !selecting) {
-      clearTimeout(histShowT); histPinned = true; H.classList.add("pinned");
+      clearTimeout(histShowT); histPinned = true;
       showHist(+a.dataset.hist, a.getBoundingClientRect());
       return;
     }
@@ -2236,38 +2213,6 @@ DNS nội bộ, 192.168.1.5, Máy chủ, dns, example.local
   }, true);
   addEventListener("scroll", () => { if (!H.hidden && !histPinned) hideHist(); }, { passive: true });
   addEventListener("resize", () => { if (!H.hidden) placeHist(); });
-
-  // ------------------------------------------------------------ khung nhat ky: an/hien, do rong, co chu
-  const LOG_W = { min: 240, max: 900, def: 340 };
-  const logUi = { show: store.get("logShow", true), w: store.get("logW", LOG_W.def), fs: store.get("logFs", 13) };
-  function clampW(w) { return Math.round(Math.min(Math.max(w, LOG_W.min), Math.min(LOG_W.max, innerWidth * 0.7))); }
-  function applyLog() {
-    document.body.classList.toggle("nolog", !logUi.show);
-    $("btnLog").classList.toggle("on", logUi.show);
-    $("btnLog").title = logUi.show ? "Đang hiện nhật ký – bấm để ẩn" : "Đang ẩn nhật ký – bấm để hiện";
-    document.documentElement.style.setProperty("--log-w", clampW(logUi.w) + "px");
-    document.documentElement.style.setProperty("--log-fs", logUi.fs + "px");
-    $("logSmaller").disabled = logUi.fs <= 11; $("logBigger").disabled = logUi.fs >= 22;
-  }
-  const saveLog = () => { store.set("logShow", logUi.show); store.set("logW", logUi.w); store.set("logFs", logUi.fs); applyLog(); };
-  $("btnLog").onclick = () => { logUi.show = !logUi.show; saveLog(); };
-  $("logHide").onclick = () => { logUi.show = false; saveLog(); };
-  $("logSmaller").onclick = () => { logUi.fs = Math.max(11, logUi.fs - 1); saveLog(); };
-  $("logBigger").onclick = () => { logUi.fs = Math.min(22, logUi.fs + 1); saveLog(); };
-  $("logNarrow").onclick = () => { logUi.w = clampW(clampW(logUi.w) - 80); saveLog(); };
-  $("logWide").onclick = () => { logUi.w = clampW(clampW(logUi.w) + 80); saveLog(); };
-  // keo canh trai cua khung de chinh do rong
-  const rz = $("logResizer");
-  rz.addEventListener("pointerdown", e => {
-    e.preventDefault(); rz.setPointerCapture(e.pointerId); document.body.classList.add("resizing");
-    const right = $("events").closest("aside").getBoundingClientRect().right;
-    const move = ev => { logUi.w = clampW(right - ev.clientX); applyLog(); };
-    const up = () => { rz.removeEventListener("pointermove", move); rz.removeEventListener("pointerup", up);
-      document.body.classList.remove("resizing"); saveLog(); };
-    rz.addEventListener("pointermove", move); rz.addEventListener("pointerup", up);
-  });
-  rz.addEventListener("dblclick", () => { logUi.w = LOG_W.def; logUi.fs = 13; saveLog(); });
-  addEventListener("resize", applyLog);
 
   // ------------------------------------------------------------ kieu hien thi
   function applyView() {
@@ -2332,7 +2277,7 @@ DNS nội bộ, 192.168.1.5, Máy chủ, dns, example.local
     if (S && !document.querySelector(".modal:not([hidden])")) render();
   }, 1000);
   setInterval(poll, POLL_MS);
-  applyTheme(); applyLog(); applyView(); updSoundBtn();
+  applyTheme(); applyView(); updSoundBtn();
   poll();
 })();
 </script>
@@ -2340,6 +2285,63 @@ DNS nội bộ, 192.168.1.5, Máy chủ, dns, example.local
 </html>
 __PINGMON_EOF_2__
 ok 'app/index.html'
+
+cat > 'README.md' <<'__PINGMON_EOF_3__'
+# Website giám sát mạng nội bộ (pingmon)
+
+Máy chủ `awx` (10.10.90.183) · Thư mục `~/pingmon` · https://monitor.cpt.gov.vn
+
+## Tính năng
+- Giám sát **Ping**, **cổng TCP**, **web HTTP(S)**, **máy chủ DNS**.
+- Khi thiết bị **đổi trạng thái**, mọi trình duyệt đang mở trang sẽ:
+  - phát âm báo (tít‑tút khi **mất kết nối**, chuông đi lên khi **kết nối lại**),
+  - đọc tên thiết bị bằng giọng tiếng Việt (nếu máy có giọng Việt),
+  - hiện thông báo góc màn hình, ô thiết bị nháy viền, ghi nhật ký.
+- Ai cũng xem được; **thêm / sửa / xoá** cần đăng nhập quản trị.
+- Nhập hàng loạt (dán từ Excel hoặc dán nguyên kết quả quét mạng `IP  2 ms  HOSTNAME`), tuỳ chọn **xoá danh sách cũ rồi nhập mới**.
+- **Chọn nhiều** → xoá / tạm dừng / tiếp tục / chuyển nhóm hàng loạt; **Xoá tất cả** trong ⚙ Cài đặt.
+- Hai kiểu xem: **Ô** (chọn cỡ ô) và **Danh sách** (bảng, hiện đủ tên dài); xuất CSV; lọc theo nhóm / trạng thái / tìm kiếm.
+- 13 kiểu âm báo mất kết nối, 9 kiểu âm báo kết nối lại, hoặc **tệp âm thanh riêng** (mp3/wav ≤ 1,5 MB); chọn số lần lặp.
+- Trình duyệt mất kết nối tới máy chủ giám sát > 15 giây → báo vàng + âm cảnh báo.
+- **Giao diện Ngày / Đêm / Tự động** (nút 🌙 trên thanh tiêu đề; Tự động: ngày 6:00–18:00).
+- **Trỏ chuột vào tên thiết bị** → hiện nhật ký riêng của thiết bị: số lần mất kết nối, tổng thời gian mất,
+  % hoạt động trong 24 giờ / 7 ngày / 30 ngày, và từng lần mất kéo dài bao lâu. Bấm vào tên để ghim (dùng được trên điện thoại).
+
+## Lệnh
+```bash
+./installer            # cài đặt / cập nhật (giữ nguyên dữ liệu, mật khẩu, chứng chỉ)
+./installer status     # trạng thái
+./installer logs       # xem nhật ký (Ctrl+C để thoát)
+./installer password   # xem mật khẩu quản trị
+./installer uninstall  # dừng và gỡ container (giữ dữ liệu)
+```
+
+## Máy trực
+Mở https://monitor.cpt.gov.vn → bấm **"Bấm để bật âm thanh thông báo"** (một lần mỗi khi mở trình duyệt).
+
+Tự mở khi khởi động Windows, không cần bấm: tạo shortcut trong `shell:startup`:
+```
+"C:\Program Files\Google\Chrome\Application\chrome.exe" --kiosk --autoplay-policy=no-user-gesture-required https://monitor.cpt.gov.vn
+```
+Giọng đọc tiếng Việt trên Windows 10/11: **Cài đặt → Thời gian và ngôn ngữ → Giọng nói → Thêm giọng nói → Tiếng Việt** (Microsoft An), rồi mở lại Chrome.
+Nút **🔊 Âm thanh** trên trang: bật/tắt từng loại âm, chọn giọng, âm lượng, nhắc lại khi còn thiết bị mất kết nối.
+
+## Nhập danh sách
+Mỗi dòng: `Tên, IP, Nhóm, Loại, Cổng/URL/Tên miền` — chỉ cần `Tên, IP` (mặc định Ping).
+```
+Core Switch, 10.10.1.1, Lõi
+Web nội bộ, 10.10.90.10, Máy chủ, http, https://10.10.90.10/
+Remote Desktop, 10.10.90.20, Máy chủ, tcp, 3389
+DNS nội bộ, 10.10.90.2, Máy chủ, dns, cpt.gov.vn
+```
+
+## Ghi chú
+- Mặc định: kiểm tra mỗi 10 giây, báo mất kết nối sau 3 lần lỗi liên tiếp (~30 giây). Đổi trong **⚙ Cài đặt**.
+- HTTP được coi là hoạt động khi máy chủ trả mã < 500 (kể cả 401/403/404).
+- Dữ liệu: `~/pingmon/data/pingmon.db` (SQLite). Sao lưu: `cp ~/pingmon/data/pingmon.db ~/pingmon-$(date +%F).db`
+- Chứng chỉ cài lên máy trạm: `~/pingmon/pingmon.crt` (`certutil -addstore -f Root pingmon.crt`). Nếu đã cài `checkmate.crt` trước đó thì không cần cài lại — installer dùng lại cùng chứng chỉ.
+__PINGMON_EOF_3__
+ok 'README.md'
 
 # ---------------------------------------------------------------- 5. .env
 step "Cau hinh"
