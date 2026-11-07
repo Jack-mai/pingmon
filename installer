@@ -216,7 +216,6 @@ PLAIN_PORT = int(os.environ.get("PORT", "8080"))          # khi khong co chung c
 PUBLIC_HTTPS_PORT = int(os.environ.get("PUBLIC_HTTPS_PORT", "443"))
 PING_CMD = os.environ.get("PING_CMD", "ping")
 WORKERS = int(os.environ.get("WORKERS", "64"))
-EVENT_KEEP_DAYS = 180
 HIST_LEN = 30
 
 DEFAULT_SETTINGS = {
@@ -225,6 +224,7 @@ DEFAULT_SETTINGS = {
     "timeout": 2,           # giay cho moi lan kiem tra
     "fail_threshold": 3,    # so lan loi lien tiep -> MAT KET NOI
     "ok_threshold": 1,      # so lan thanh cong lien tiep -> KET NOI LAI
+    "event_keep_days": 180, # tu dong xoa nhat ky su kien cu hon so ngay nay
 }
 TYPES = ("ping", "tcp", "http", "dns")
 HOST_RE = re.compile(r"^[A-Za-z0-9_.:\[\]-]{1,253}$")
@@ -237,6 +237,7 @@ settings = dict(DEFAULT_SETTINGS)
 sessions = {}     # token -> het han
 inflight = set()
 version = 0
+events_epoch = 0  # tang moi khi nhat ky bi xoa -> trinh duyet tai lai nhat ky
 
 
 def log(*a):
@@ -270,6 +271,9 @@ def db_init():
                 settings[row["key"]] = json.loads(row["value"])
             except Exception:
                 pass
+    global events_epoch
+    row = db.execute("SELECT value FROM settings WHERE key='events_epoch'").fetchone()
+    events_epoch = int(row["value"]) if row else 0
     for row in db.execute("SELECT * FROM devices"):
         d = dict(row)
         devices[d["id"]] = d
@@ -289,9 +293,25 @@ def add_event(d, kind, detail=""):
         "INSERT INTO events(ts, device_id, name, host, kind, detail) VALUES (?,?,?,?,?,?)",
         (time.time(), d.get("id"), d.get("name"), d.get("host"), kind, detail or ""))
     db.commit()
-    if cur.lastrowid % 500 == 0:
-        db.execute("DELETE FROM events WHERE ts < ?", (time.time() - EVENT_KEEP_DAYS * 86400,))
-        db.commit()
+    return cur.lastrowid
+
+
+def purge_old_events():
+    """Xoa nhat ky cu hon event_keep_days. Goi khi dang giu lock."""
+    cur = db.execute("DELETE FROM events WHERE ts < ?", (time.time() - settings["event_keep_days"] * 86400,))
+    db.commit()
+    if cur.rowcount:
+        bump_epoch()
+        log(f"Tu dong xoa {cur.rowcount} su kien cu hon {settings['event_keep_days']} ngay")
+    return cur.rowcount
+
+
+def bump_epoch():
+    global events_epoch, version
+    events_epoch += 1
+    db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES ('events_epoch', ?)", (str(events_epoch),))
+    db.commit()
+    version += 1
 
 
 # =================================================================== Kiem tra
@@ -453,8 +473,16 @@ def apply_result(did, snap, ok, rtt, msg):
 
 def scheduler():
     pool = ThreadPoolExecutor(max_workers=WORKERS)
+    next_purge = time.time() + 60
     while True:
         now = time.time()
+        if now >= next_purge:                 # don nhat ky cu moi gio
+            next_purge = now + 3600
+            with lock:
+                try:
+                    purge_old_events()
+                except Exception as e:
+                    log("Loi don nhat ky:", e)
         jobs = []
         with lock:
             for did, d in devices.items():
@@ -656,7 +684,7 @@ def parse_import_line(line, default_grp=""):
        2) Dan thang ket qua quet mang: IP <tab> 2 ms <tab> HOSTNAME  (Advanced IP Scanner, PingInfoView...)"""
     parts = [p.strip() for p in re.split(r"[,;\t]", line)]
     if len(parts) == 1:
-        parts = parts[0].split()          # "10.10.90.1   2 ms   HOST" cach bang khoang trang
+        parts = parts[0].split()          # "192.168.1.1   2 ms   HOST" cach bang khoang trang
         if len(parts) == 1:
             parts = [parts[0], parts[0]]
     # Kieu 2: cot dau la IP, cot 2 khong phai dia chi (vd "2 ms") -> lay hostname o cot sau
@@ -709,7 +737,8 @@ def api_import(body):
 
 def api_settings(body):
     global version
-    limits = {"interval": (5, 3600), "timeout": (1, 30), "fail_threshold": (1, 20), "ok_threshold": (1, 20)}
+    limits = {"interval": (5, 3600), "timeout": (1, 30), "fail_threshold": (1, 20), "ok_threshold": (1, 20),
+              "event_keep_days": (1, 3650)}
     with lock:
         for k, (lo, hi) in limits.items():
             if k in body:
@@ -727,6 +756,8 @@ def api_settings(body):
         for k, v in settings.items():
             db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?,?)", (k, json.dumps(v)))
         db.commit()
+        if "event_keep_days" in body:
+            purge_old_events()            # ap dung ngay thoi han luu moi
         version += 1
     return 200, {"ok": True, "settings": settings}
 
@@ -755,6 +786,7 @@ def snapshot(since, admin):
             "now": time.time(), "version": version, "settings": settings,
             "admin": admin, "auth": bool(ADMIN_PASSWORD),
             "devices": out, "events": [dict(x) for x in rows], "last_event_id": last,
+            "events_epoch": events_epoch,
         }
 
 
@@ -792,6 +824,67 @@ def device_history(did):
             "since": d["since"], "created": d.get("created"),
             "stats": {"day": stat(86400), "week": stat(7 * 86400), "month": stat(30 * 86400)},
             "events": rows[::-1][:60]}
+
+
+def api_events_clear(body):
+    """Xoa nhat ky su kien.
+       {"mode": "all"}                       toan bo
+       {"mode": "older", "days": 30}         cu hon N ngay
+       {"mode": "device", "device_id": 5}    cua 1 thiet bi
+       {"mode": "ids", "ids": [12, 13]}      tung su kien
+       "dry_run": true -> chi dem, khong xoa."""
+    mode = body.get("mode")
+    if mode == "all":
+        where, args, label = "1=1", (), "toàn bộ"
+    elif mode == "older":
+        try:
+            days = float(body.get("days"))
+            assert days >= 0
+        except Exception:
+            return 400, {"error": "Số ngày không hợp lệ"}
+        where, args, label = "ts < ?", (time.time() - days * 86400,), f"cũ hơn {days:g} ngày"
+    elif mode == "device":
+        try:
+            did = int(body.get("device_id"))
+        except Exception:
+            return 400, {"error": "Chưa chọn thiết bị"}
+        name = devices.get(did, {}).get("name", f"#{did}")
+        where, args, label = "device_id = ?", (did,), f"thiết bị {name}"
+    elif mode == "ids":
+        try:
+            ids = [int(x) for x in body.get("ids") or []][:5000]
+        except Exception:
+            ids = []
+        if not ids:
+            return 400, {"error": "Chưa chọn sự kiện"}
+        where, args, label = f"id IN ({','.join('?' * len(ids))})", tuple(ids), ""
+    else:
+        return 400, {"error": "Thao tác không hợp lệ"}
+    with lock:
+        count = db.execute(f"SELECT COUNT(*) FROM events WHERE {where}", args).fetchone()[0]
+        if body.get("dry_run") is True:
+            return 200, {"ok": True, "count": count}
+        if count:
+            db.execute(f"DELETE FROM events WHERE {where}", args)
+            db.commit()
+            if mode != "ids":   # ghi lai ai da xoa gi (khong ghi cho xoa tung dong)
+                add_event({"name": f"{count} sự kiện", "host": ""}, "clearlog", label)
+            bump_epoch()
+            log(f"Xoa nhat ky ({mode} {label}): {count} su kien")
+    return 200, {"ok": True, "deleted": count}
+
+
+def export_events_csv():
+    with lock:
+        rows = db.execute("SELECT ts, kind, name, host, detail FROM events ORDER BY id").fetchall()
+    def q(v):
+        v = "" if v is None else str(v)
+        return '"' + v.replace('"', '""') + '"' if any(c in v for c in ',"\n') else v
+    out = ["thoi_gian,su_kien,ten,dia_chi,chi_tiet"]
+    for r in rows:
+        out.append(",".join(q(x) for x in (datetime.fromtimestamp(r["ts"]).strftime("%Y-%m-%d %H:%M:%S"),
+                                             r["kind"], r["name"], r["host"], r["detail"])))
+    return "\ufeff" + "\n".join(out) + "\n"     # BOM: Excel mo dung tieng Viet
 
 
 def export_csv():
@@ -867,6 +960,12 @@ class Handler(BaseHTTPRequestHandler):
                 did = 0
             h = device_history(did)
             return self._send(200, h) if h else self._send(404, {"error": "Không tìm thấy thiết bị"})
+        if u.path == "/api/events/export":
+            if not self.is_admin():
+                return self._send(403, {"error": "Cần đăng nhập quản trị"})
+            fn = "nhat-ky-" + datetime.now().strftime("%Y%m%d-%H%M") + ".csv"
+            return self._send(200, export_events_csv().encode("utf-8"), "text/csv; charset=utf-8",
+                              {"Content-Disposition": f'attachment; filename="{fn}"'})
         if u.path == "/api/export":
             if not self.is_admin():
                 return self._send(403, {"error": "Cần đăng nhập quản trị"})
@@ -924,6 +1023,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/device/bulk": api_device_bulk,
             "/api/import": api_import,
             "/api/settings": api_settings,
+            "/api/events/clear": api_events_clear,
         }
         fn = routes.get(u.path)
         if not fn:
@@ -1101,8 +1201,11 @@ cat > 'app/index.html' <<'__PINGMON_EOF_2__'
   #selbar b { margin-right: 6px; }
   #selbar .sp { flex: 1; }
 
-  main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; padding: 14px 20px 24px; align-items: start; }
-  @media (max-width: 1000px) { main { grid-template-columns: 1fr; } aside { position: static !important; max-height: 60vh !important; } }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) var(--log-w, 340px); gap: 16px; padding: 14px 20px 24px; align-items: start; }
+  body.nolog main { grid-template-columns: minmax(0, 1fr); }
+  body.nolog aside { display: none; }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; } aside { position: static !important; max-height: 60vh !important; }
+    .resizer { display: none; } }
 
   /* ---------- tiles ---------- */
   .group-title { grid-column: 1 / -1; color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase;
@@ -1140,8 +1243,9 @@ cat > 'app/index.html' <<'__PINGMON_EOF_2__'
   .spark i.f { background: var(--down); }
   .spark i.e { background: var(--line); }
   .t-msg { font-size: 12px; color: var(--down-text); margin-top: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .t-edit { position: absolute; bottom: 8px; right: 8px; padding: 2px 8px; font-size: 12px; opacity: 0; }
+  .t-edit { flex: none; padding: 0 7px; font-size: 12px; line-height: 18px; font-weight: 600; opacity: .55; margin-top: 1px; }
   .tile:hover .t-edit { opacity: 1; }
+  .t-edit:hover { border-color: var(--accent); color: var(--accent); }
   .selecting .t-edit { display: none; }
   .empty { grid-column: 1 / -1; text-align: center; color: var(--muted); padding: 50px 10px;
     border: 1px dashed var(--line); border-radius: var(--radius); }
@@ -1167,17 +1271,36 @@ cat > 'app/index.html' <<'__PINGMON_EOF_2__'
 
   /* ---------- events ---------- */
   aside { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); position: sticky; top: 70px;
-    max-height: calc(100vh - 90px); display: flex; flex-direction: column; }
-  aside h2 { font-size: 14px; margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 8px; }
-  aside h2 label { margin: 0 0 0 auto; display: flex; align-items: center; gap: 5px; font-weight: 400; cursor: pointer; }
+    max-height: calc(100vh - 90px); display: flex; flex-direction: column; --fs: var(--log-fs, 13px); }
+  aside h2 { font-size: 14px; margin: 0; padding: 8px 8px 8px 14px; border-bottom: 1px solid var(--line); display: flex; align-items: center;
+    gap: 4px; flex-wrap: wrap; white-space: nowrap; }
+  aside h2 .sp { flex: 1; }
+  aside h2 label { margin: 0; display: flex; align-items: center; gap: 5px; font-weight: 400; cursor: pointer; font-size: 12px; }
+  aside h2 button { padding: 1px 6px; font-size: 12px; line-height: 20px; }
+  .resizer { position: absolute; left: -11px; top: 0; bottom: 0; width: 10px; cursor: col-resize; z-index: 2; }
+  .resizer::after { content: ""; position: absolute; left: 4px; top: 50%; height: 44px; margin-top: -22px; width: 3px;
+    border-radius: 2px; background: var(--line); }
+  .resizer:hover::after, body.resizing .resizer::after { background: var(--accent); }
+  body.resizing { cursor: col-resize; user-select: none; }
   #events { overflow: auto; flex: 1; }
-  .ev { display: grid; grid-template-columns: 58px 1fr; gap: 8px; padding: 7px 14px; border-bottom: 1px solid var(--line); font-size: 13px; }
-  .ev time { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; line-height: 1.3; }
-  .ev .k { font-weight: 700; font-size: 11px; letter-spacing: .03em; margin-right: 6px; }
+  .ev { display: grid; grid-template-columns: calc(var(--fs) * 4.5) 1fr; gap: 8px; padding: 7px 14px; border-bottom: 1px solid var(--line);
+    font-size: var(--fs); }
+  .ev time { color: var(--muted); font-variant-numeric: tabular-nums; font-size: calc(var(--fs) - 1px); line-height: 1.3; }
+  .ev .k { font-weight: 700; font-size: calc(var(--fs) - 2px); letter-spacing: .03em; margin-right: 6px; }
   .ev .k.down { color: var(--down); } .ev .k.up { color: var(--up); }
   .ev .k.other { color: var(--muted); }
   .ev .n { overflow-wrap: anywhere; }
-  .ev .d { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+  .ev .d { color: var(--muted); font-size: calc(var(--fs) - 1px); overflow-wrap: anywhere; }
+  .ev { position: relative; }
+  .ev-del { position: absolute; right: 8px; top: 6px; padding: 0 6px; font-size: 11px; line-height: 18px; opacity: 0;
+    background: var(--panel); }
+  .ev:hover .ev-del { opacity: .8; }
+  .ev-del:hover { opacity: 1; color: var(--down); border-color: var(--down); }
+  .ev .k.clearlog { color: var(--warn); }
+  .radio { display: flex; align-items: center; gap: 8px; margin: 12px 0; color: var(--text); font-size: 14px; cursor: pointer; flex-wrap: wrap; }
+  .radio input { width: auto; margin: 0; } .radio select { width: auto; min-width: 130px; max-width: 100%; padding: 5px 8px; }
+  #clPreview { margin-top: 14px; font-weight: 700; }
+  #hist .hf a { color: var(--down); text-decoration: none; font-weight: 600; }
   .ev.new { animation: evnew 3s; }
   @keyframes evnew { from { background: var(--evnew); } }
 
@@ -1220,6 +1343,7 @@ cat > 'app/index.html' <<'__PINGMON_EOF_2__'
   #hist { position: fixed; z-index: 25; width: 400px; max-width: calc(100vw - 16px); max-height: min(560px, 80vh);
     background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 14px 36px var(--shadow);
     display: flex; flex-direction: column; overflow: hidden; }
+  #hist:not(.pinned) { pointer-events: none; }
   #hist .hh { padding: 12px 14px 10px; border-bottom: 1px solid var(--line); }
   #hist .hh .nm { font-size: 15px; font-weight: 700; overflow-wrap: anywhere; display: flex; gap: 8px; align-items: flex-start; }
   #hist .hh .nm .dot { margin-top: 6px; }
@@ -1292,6 +1416,7 @@ cat > 'app/index.html' <<'__PINGMON_EOF_2__'
     <option value="200">Ô nhỏ</option><option value="230">Ô vừa</option><option value="300">Ô rộng</option><option value="380">Ô rất rộng</option>
   </select>
   <span class="sp"></span>
+  <button id="btnLog" title="Ẩn / hiện khung nhật ký sự kiện">📋 Nhật ký</button>
   <button id="btnSelect" hidden>☑ Chọn nhiều</button>
   <button id="btnImport" hidden>Nhập danh sách</button>
   <button id="btnExport" hidden>Xuất CSV</button>
@@ -1314,7 +1439,16 @@ cat > 'app/index.html' <<'__PINGMON_EOF_2__'
 <main>
   <div id="grid"></div>
   <aside>
-    <h2>Nhật ký sự kiện <label><input type="checkbox" id="evOnlyState" checked> chỉ mất/kết nối lại</label></h2>
+    <div class="resizer" id="logResizer" title="Kéo để chỉnh độ rộng khung nhật ký (bấm đúp: về mặc định)"></div>
+    <h2>Nhật ký sự kiện <span class="sp"></span>
+      <button class="ghost" id="logSmaller" title="Chữ nhỏ hơn">A−</button>
+      <button class="ghost" id="logBigger" title="Chữ to hơn">A+</button>
+      <button class="ghost" id="logNarrow" title="Thu hẹp khung">Hẹp</button>
+      <button class="ghost" id="logWide" title="Mở rộng khung">Rộng</button>
+      <button class="ghost" id="logHide" title="Ẩn nhật ký">✕</button>
+    </h2>
+    <h2 style="padding-top:4px;padding-bottom:6px;border-bottom:1px solid var(--line)"><label><input type="checkbox" id="evOnlyState" checked> chỉ hiện mất / kết nối lại</label><span class="sp"></span>
+      <button class="ghost" id="logClear" title="Xoá nhật ký sự kiện" hidden>🗑 Xoá nhật ký</button></h2>
     <div id="events"></div>
   </aside>
 </main>
@@ -1340,10 +1474,10 @@ cat > 'app/index.html' <<'__PINGMON_EOF_2__'
       <div><label>Nhóm</label><input name="grp" list="groups" placeholder="VD: Tầng 3" maxlength="60"></div>
     </div>
     <label id="lHost">Địa chỉ IP / tên máy</label>
-    <input name="host" placeholder="VD: 10.10.1.1">
+    <input name="host" placeholder="VD: 192.168.1.1">
     <div data-for="tcp dns"><label>Cổng</label><input name="port" type="number" min="1" max="65535" placeholder="VD: 3389"></div>
-    <div data-for="http"><label>URL</label><input name="target" data-t="http" placeholder="https://10.10.1.5/"></div>
-    <div data-for="dns"><label>Tên miền cần phân giải</label><input name="target" data-t="dns" placeholder="VD: cpt.gov.vn"></div>
+    <div data-for="http"><label>URL</label><input name="target" data-t="http" placeholder="https://192.168.1.20/"></div>
+    <div data-for="dns"><label>Tên miền cần phân giải</label><input name="target" data-t="dns" placeholder="VD: example.local"></div>
     <label>Ghi chú</label>
     <input name="note" maxlength="300" placeholder="Vị trí, người phụ trách…">
     <label class="check"><input type="checkbox" name="enabled" checked> Đang giám sát</label>
@@ -1362,13 +1496,13 @@ cat > 'app/index.html' <<'__PINGMON_EOF_2__'
   <form class="box wide" id="fImport">
     <h3>Nhập danh sách thiết bị</h3>
     <div class="hint">Mỗi dòng một thiết bị: <code>Tên, IP, Nhóm, Loại, Cổng/URL/Tên miền</code> — chỉ cần <code>Tên, IP</code> (mặc định Ping).<br>
-      Có thể dán thẳng từ Excel, hoặc <b>dán nguyên kết quả quét mạng</b> dạng <code>10.10.90.21  2 ms  TTBC-KT1-GATEWA</code> (tự lấy hostname làm tên).</div>
-    <textarea name="text" placeholder="Core Switch, 10.10.1.1, Lõi
-Firewall, 10.10.1.254, Lõi
-Web nội bộ, 10.10.90.10, Máy chủ, http, https://10.10.90.10/
-Remote Desktop, 10.10.90.20, Máy chủ, tcp, 3389
-DNS nội bộ, 10.10.90.2, Máy chủ, dns, cpt.gov.vn
-10.10.90.21	2 ms	TTBC-KT1-GATEWA"></textarea>
+      Có thể dán thẳng từ Excel, hoặc <b>dán nguyên kết quả quét mạng</b> dạng <code>192.168.1.21  2 ms  SRV-APP-01</code> (tự lấy hostname làm tên).</div>
+    <textarea name="text" placeholder="Switch lõi, 192.168.1.2, Lõi mạng
+Firewall, 192.168.1.3, Lõi mạng
+Web nội bộ, 192.168.1.20, Máy chủ, http, https://192.168.1.20/
+Remote Desktop, 192.168.1.21, Máy chủ, tcp, 3389
+DNS nội bộ, 192.168.1.5, Máy chủ, dns, example.local
+192.168.1.50	2 ms	PRINTER-T1"></textarea>
     <div class="row2">
       <div><label>Nhóm mặc định (cho dòng không ghi nhóm)</label><input name="grp" list="groups" maxlength="60"></div>
       <div></div>
@@ -1410,6 +1544,10 @@ DNS nội bộ, 10.10.90.2, Máy chủ, dns, cpt.gov.vn
       <div><label>Lỗi liên tiếp → báo mất kết nối</label><input name="fail_threshold" type="number" min="1" max="20"></div>
       <div><label>Thành công liên tiếp → báo kết nối lại</label><input name="ok_threshold" type="number" min="1" max="20"></div>
     </div>
+    <div class="row2">
+      <div><label>Tự xoá nhật ký cũ hơn (ngày)</label><input name="event_keep_days" type="number" min="1" max="3650"></div>
+      <div></div>
+    </div>
     <div class="hint" id="sHint"></div>
     <div class="danger-zone">
       <p>Xoá <b>toàn bộ</b> thiết bị đang giám sát (nhật ký sự kiện vẫn được giữ).</p>
@@ -1434,6 +1572,28 @@ DNS nội bộ, 10.10.90.2, Máy chủ, dns, cpt.gov.vn
     <div class="actions">
       <button type="button" class="ghost" data-close>Huỷ</button>
       <button type="submit" class="danger solid" id="cOk">Xoá</button>
+    </div>
+  </form>
+</div>
+
+<!-- ===== Xoa nhat ky su kien ===== -->
+<div class="modal" id="mClearLog" hidden>
+  <form class="box" id="fClearLog">
+    <h3>Xoá nhật ký sự kiện</h3>
+    <label class="radio"><input type="radio" name="mode" value="older" checked> <span>Xoá sự kiện cũ hơn</span>
+      <select name="days"><option value="1">1 ngày</option><option value="7">7 ngày</option><option value="30" selected>30 ngày</option>
+        <option value="90">90 ngày</option><option value="180">180 ngày</option></select></label>
+    <label class="radio"><input type="radio" name="mode" value="device"> <span>Chỉ nhật ký của thiết bị</span>
+      <select name="device_id"></select></label>
+    <label class="radio"><input type="radio" name="mode" value="all"> <span>Toàn bộ nhật ký</span></label>
+    <div id="clPreview"></div>
+    <div class="hint" data-i18n="clearHint">Chỉ xoá nhật ký, không ảnh hưởng tới thiết bị và trạng thái giám sát hiện tại.
+      Thống kê trong ô lịch sử (số lần mất kết nối, % hoạt động) được tính từ nhật ký, nên phần đã xoá sẽ không còn được tính.</div>
+    <div class="err" id="clErr"></div>
+    <div class="actions">
+      <button type="button" class="ghost left" id="clExport">⬇ Xuất nhật ký CSV</button>
+      <button type="button" class="ghost" data-close>Huỷ</button>
+      <button type="submit" class="danger solid" id="clOk">Xoá</button>
     </div>
   </form>
 </div>
@@ -1502,15 +1662,21 @@ DNS nội bộ, 10.10.90.2, Máy chủ, dns, cpt.gov.vn
 </div>
 
 <script>
+  // Ham dinh dang chuoi (ban tieng Viet): t("Đã xoá {0} sự kiện", 5)
+  function t(s, ...args) { args.forEach((a, i) => { s = s.split("{" + i + "}").join(a); }); return s; }
+  const trMsg = s => s || "";
+</script>
+<script>
 (() => {
   "use strict";
   const $ = id => document.getElementById(id);
   const POLL_MS = 2000, LOST_MS = 15000;
   const TYPE_LABEL = { ping: "PING", tcp: "TCP", http: "HTTP", dns: "DNS" };
   const EV_LABEL = { down: "MẤT KẾT NỐI", up: "KẾT NỐI LẠI", add: "THÊM", edit: "SỬA", delete: "XOÁ",
-                     pause: "TẠM DỪNG", resume: "TIẾP TỤC", import: "NHẬP" };
+                     pause: "TẠM DỪNG", resume: "TIẾP TỤC", import: "NHẬP", clearlog: "XOÁ NHẬT KÝ" };
 
   let S = null, lastEv = null, events = [], skew = 0, lastOk = Date.now(), lost = false;
+  let evEpoch = null;
   let filter = "all", flashUntil = {}, lastRemind = Date.now();
   let selecting = false; const picked = new Set(); let visibleIds = [];
 
@@ -1764,7 +1930,7 @@ DNS nội bộ, 10.10.90.2, Máy chủ, dns, cpt.gov.vn
     grid.innerHTML = !list.length ? emptyHtml(devs.length) : (ui.view === "list" ? listHtml(list, now) : tilesHtml(list, now, groups.length > 1 && !$("fGroup").value));
 
     document.body.classList.toggle("admin", S.admin);
-    ["btnAdd", "btnImport", "btnExport", "btnSettings", "btnSelect"].forEach(id => $(id).hidden = !S.admin);
+    ["btnAdd", "btnImport", "btnExport", "btnSettings", "btnSelect", "logClear"].forEach(id => $(id).hidden = !S.admin);
     $("btnLogin").hidden = S.admin || !S.auth;
     $("btnLogout").hidden = !S.auth;
     if (!S.admin && selecting) setSelecting(false);
@@ -1798,13 +1964,12 @@ DNS nội bộ, 10.10.90.2, Máy chủ, dns, cpt.gov.vn
                   d.status === "down" ? `từ ${fmtTime(d.since, false)}` : "";
       html += `<div class="tile ${cls}" data-id="${d.id}">
         <div class="t-head">${selecting ? `<input type="checkbox" tabindex="-1" ${picked.has(d.id) ? "checked" : ""}>` : '<span class="dot"></span>'}
-          <span class="t-name"><span data-hist="${d.id}">${esc(d.name)}</span></span><span class="badge">${TYPE_LABEL[d.type]}</span></div>
+          <span class="t-name"><span data-hist="${d.id}">${esc(d.name)}</span></span><span class="badge">${TYPE_LABEL[d.type]}</span>${S.admin ? `<button class="t-edit" data-edit="${d.id}" title="Sửa thiết bị">✎</button>` : ""}</div>
         <div class="t-host">${esc(devTarget(d))}${d.grp && !showGroups ? " · " + esc(d.grp) : ""}</div>
         <div class="t-row"><span class="t-state">${STATE_LABEL[d.status]}</span><span class="t-dur">${right}</span></div>
         <div class="t-row"><span class="t-dur">${sub}</span></div>
         <div class="spark">${spark}</div>
         ${d.status === "down" && d.msg ? `<div class="t-msg">${esc(d.msg)}</div>` : ""}
-        ${S.admin ? `<button class="t-edit" data-edit="${d.id}">Sửa</button>` : ""}
       </div>`;
     }
     return html;
@@ -1835,10 +2000,11 @@ DNS nội bộ, 10.10.90.2, Máy chủ, dns, cpt.gov.vn
     const list = events.filter(e => !only || e.kind === "down" || e.kind === "up").slice(-150).reverse();
     const devIds = new Set(S ? S.devices.map(d => d.id) : []);
     $("events").innerHTML = list.map(e => {
-      const k = e.kind === "down" || e.kind === "up" ? e.kind : "other";
+      const k = e.kind === "down" || e.kind === "up" || e.kind === "clearlog" ? e.kind : "other";
+      const dl = [e.host, trMsg(e.detail)].filter(Boolean).join(" · ");
       return `<div class="ev${e._new ? " new" : ""}"><time>${fmtTime(e.ts)}</time><div>
-        <span class="k ${k}">${EV_LABEL[e.kind] || e.kind}</span><span class="n"${e.device_id && devIds.has(e.device_id) ? ` data-hist="${e.device_id}"` : ""}>${esc(e.name)}</span>
-        ${e.host ? `<div class="d">${esc(e.host)}${e.detail ? " · " + esc(e.detail) : ""}</div>` : ""}</div></div>`;
+        <span class="k ${k}">${EV_LABEL[e.kind] || e.kind}</span><span class="n"${e.device_id && devIds.has(e.device_id) ? ` data-hist="${e.device_id}"` : ""}>${esc(e.device_id ? e.name : trMsg(e.name))}</span>
+        ${dl ? `<div class="d">${esc(dl)}</div>` : ""}</div>${S && S.admin ? `<button class="ev-del" data-evdel="${e.id}" title="${t("Xoá sự kiện này")}">✕</button>` : ""}</div>`;
     }).join("") || '<div class="ev"><span></span><div class="d">Chưa có sự kiện</div></div>';
     events.forEach(e => delete e._new);
   }
@@ -1857,6 +2023,13 @@ DNS nội bộ, 10.10.90.2, Máy chủ, dns, cpt.gov.vn
       const r = await fetch("api/state?since=" + since, { cache: "no-store", credentials: "same-origin" });
       if (!r.ok) throw new Error(r.status);
       const j = await r.json();
+      if (evEpoch !== null && j.events_epoch !== evEpoch) {
+        evEpoch = j.events_epoch; lastEv = null; events = [];
+        Object.keys(histCache).forEach(k => delete histCache[k]);
+        if (histId && !H.hidden) showHist(histId, histRect);
+        return poll();
+      }
+      evEpoch = j.events_epoch;
       skew = j.now - Date.now() / 1000;
       lastOk = Date.now();
       if (lost) { lost = false; toast("info", "Đã kết nối lại tới máy chủ giám sát"); }
@@ -1891,7 +2064,7 @@ DNS nội bộ, 10.10.90.2, Máy chủ, dns, cpt.gov.vn
     $("conn").textContent = isLost ? "Mất kết nối máy chủ" : "Trực tuyến";
     if (isLost && !lost) {
       lost = true;
-      toast("down", "Mất kết nối tới máy chủ giám sát", "Kiểm tra mạng hoặc máy chủ awx");
+      toast("down", "Mất kết nối tới máy chủ giám sát", "Kiểm tra mạng hoặc máy chủ giám sát");
       if (!soundOff && snd.down) enqueue(async () => { await playWarn(); await speak("Mất kết nối tới máy chủ giám sát"); });
     }
   }
@@ -2046,7 +2219,7 @@ DNS nội bộ, 10.10.90.2, Máy chủ, dns, cpt.gov.vn
   const FS = $("fSettings");
   function openSettings() {
     const s = S.settings;
-    ["title", "interval", "timeout", "fail_threshold", "ok_threshold"].forEach(k => FS[k].value = s[k]);
+    ["title", "interval", "timeout", "fail_threshold", "ok_threshold", "event_keep_days"].forEach(k => FS[k].value = s[k] ?? "");
     updHint(); $("sErr").textContent = ""; open("mSettings");
   }
   function updHint() {
@@ -2056,7 +2229,7 @@ DNS nội bộ, 10.10.90.2, Máy chủ, dns, cpt.gov.vn
   FS.oninput = updHint;
   FS.onsubmit = async e => {
     e.preventDefault();
-    const b = {}; ["title", "interval", "timeout", "fail_threshold", "ok_threshold"].forEach(k => b[k] = FS[k].value);
+    const b = {}; ["title", "interval", "timeout", "fail_threshold", "ok_threshold", "event_keep_days"].forEach(k => b[k] = FS[k].value);
     try { await api("settings", b); close(FS); } catch (err) { $("sErr").textContent = err.message; }
   };
 
@@ -2131,7 +2304,7 @@ DNS nội bộ, 10.10.90.2, Máy chủ, dns, cpt.gov.vn
   const histCache = {};
   let histId = null, histShowT = null, histHideT = null, histPinned = false, histRect = null;
   const H = $("hist");
-  function hideHist() { H.hidden = true; histId = null; histPinned = false; }
+  function hideHist() { H.hidden = true; histId = null; histPinned = false; H.classList.remove("pinned"); }
   function placeHist() {
     if (!histRect) return;
     const w = H.offsetWidth, h = H.offsetHeight, vw = innerWidth, vh = innerHeight;
@@ -2181,8 +2354,9 @@ DNS nội bộ, 10.10.90.2, Máy chủ, dns, cpt.gov.vn
         <div class="sub">${esc(h.host)}</div><div class="now ${cls}">${nowTxt}</div></div>
       <div class="hstats">${statBox("24 giờ qua", h.stats.day)}${statBox("7 ngày qua", h.stats.week)}${statBox("30 ngày qua", h.stats.month)}</div>
       <div class="hl">${evs || '<div class="hempty">Chưa có sự kiện nào</div>'}</div>
-      <div class="hf"><span>${h.events.length >= 60 ? "60 sự kiện gần nhất" : h.events.length + " sự kiện"}</span><span>${histPinned ? "Bấm ra ngoài / Esc để đóng" : "Bấm vào tên để ghim"}</span></div>`;
+      <div class="hf"><span>${h.events.length >= 60 ? "60 sự kiện gần nhất" : h.events.length + " sự kiện"}</span><span>${histPinned && S && S.admin && h.events.length ? `<a href="#" data-clearhist="${h.id}">${t("🗑 Xoá nhật ký thiết bị này")}</a>` : (t(histPinned ? "Bấm ra ngoài / Esc để đóng" : "Bấm vào tên để ghim"))}</span></div>`;
     if (keep) H.querySelector(".hl").scrollTop = keep;
+    H.classList.toggle("pinned", histPinned);
     H.hidden = false; placeHist();
   }
   document.addEventListener("mouseover", e => {
@@ -2194,18 +2368,18 @@ DNS nội bộ, 10.10.90.2, Máy chủ, dns, cpt.gov.vn
       if (histPinned || (id === histId && !H.hidden)) return;
       clearTimeout(histShowT);
       const rect = a.getBoundingClientRect();
-      histShowT = setTimeout(() => showHist(id, rect), 300);
+      histShowT = setTimeout(() => showHist(id, rect), 450);
       return;
     }
     clearTimeout(histShowT);
-    if (!H.hidden && !histPinned) { clearTimeout(histHideT); histHideT = setTimeout(hideHist, 350); }
+    if (!H.hidden && !histPinned) { clearTimeout(histHideT); histHideT = setTimeout(hideHist, 150); }
   });
   // bam vao ten: ghim o lich su (dung duoc tren dien thoai)
   document.addEventListener("mousedown", e => {
     if (e.target.closest("#hist")) return;
     const a = e.target.closest("[data-hist]");
     if (a && !selecting) {
-      clearTimeout(histShowT); histPinned = true;
+      clearTimeout(histShowT); histPinned = true; H.classList.add("pinned");
       showHist(+a.dataset.hist, a.getBoundingClientRect());
       return;
     }
@@ -2213,6 +2387,101 @@ DNS nội bộ, 10.10.90.2, Máy chủ, dns, cpt.gov.vn
   }, true);
   addEventListener("scroll", () => { if (!H.hidden && !histPinned) hideHist(); }, { passive: true });
   addEventListener("resize", () => { if (!H.hidden) placeHist(); });
+
+  // ------------------------------------------------------------ khung nhat ky: an/hien, do rong, co chu
+  const LOG_W = { min: 240, max: 900, def: 340 };
+  const logUi = { show: store.get("logShow", true), w: store.get("logW", LOG_W.def), fs: store.get("logFs", 13) };
+  function clampW(w) { return Math.round(Math.min(Math.max(w, LOG_W.min), Math.min(LOG_W.max, innerWidth * 0.7))); }
+  function applyLog() {
+    document.body.classList.toggle("nolog", !logUi.show);
+    $("btnLog").classList.toggle("on", logUi.show);
+    $("btnLog").title = logUi.show ? "Đang hiện nhật ký – bấm để ẩn" : "Đang ẩn nhật ký – bấm để hiện";
+    document.documentElement.style.setProperty("--log-w", clampW(logUi.w) + "px");
+    document.documentElement.style.setProperty("--log-fs", logUi.fs + "px");
+    $("logSmaller").disabled = logUi.fs <= 11; $("logBigger").disabled = logUi.fs >= 22;
+  }
+  const saveLog = () => { store.set("logShow", logUi.show); store.set("logW", logUi.w); store.set("logFs", logUi.fs); applyLog(); };
+  $("btnLog").onclick = () => { logUi.show = !logUi.show; saveLog(); };
+  $("logHide").onclick = () => { logUi.show = false; saveLog(); };
+  $("logSmaller").onclick = () => { logUi.fs = Math.max(11, logUi.fs - 1); saveLog(); };
+  $("logBigger").onclick = () => { logUi.fs = Math.min(22, logUi.fs + 1); saveLog(); };
+  $("logNarrow").onclick = () => { logUi.w = clampW(clampW(logUi.w) - 80); saveLog(); };
+  $("logWide").onclick = () => { logUi.w = clampW(clampW(logUi.w) + 80); saveLog(); };
+  // keo canh trai cua khung de chinh do rong
+  const rz = $("logResizer");
+  rz.addEventListener("pointerdown", e => {
+    e.preventDefault(); rz.setPointerCapture(e.pointerId); document.body.classList.add("resizing");
+    const right = $("events").closest("aside").getBoundingClientRect().right;
+    const move = ev => { logUi.w = clampW(right - ev.clientX); applyLog(); };
+    const up = () => { rz.removeEventListener("pointermove", move); rz.removeEventListener("pointerup", up);
+      document.body.classList.remove("resizing"); saveLog(); };
+    rz.addEventListener("pointermove", move); rz.addEventListener("pointerup", up);
+  });
+  rz.addEventListener("dblclick", () => { logUi.w = LOG_W.def; logUi.fs = 13; saveLog(); });
+  addEventListener("resize", applyLog);
+
+  // ------------------------------------------------------------ xoa nhat ky su kien
+  const FC = $("fClearLog");
+  function clBody() {
+    const m = FC.mode.value;
+    return m === "older" ? { mode: m, days: +FC.days.value } : m === "device" ? { mode: m, device_id: +FC.device_id.value } : { mode: "all" };
+  }
+  let clSeq = 0;
+  async function clPreview() {
+    const seq = ++clSeq;
+    $("clPreview").textContent = t("Đang đếm…"); $("clErr").textContent = "";
+    try {
+      const r = await fetch("api/events/clear", { method: "POST", headers: { "Content-Type": "application/json" },
+        credentials: "same-origin", body: JSON.stringify({ ...clBody(), dry_run: true }) });
+      const j = await r.json();
+      if (seq !== clSeq) return;
+      if (!r.ok) throw new Error(trMsg(j.error));
+      $("clPreview").textContent = t("Sẽ xoá {0} sự kiện.", j.count);
+      $("clOk").disabled = !j.count;
+    } catch (err) { if (seq === clSeq) { $("clPreview").textContent = ""; $("clErr").textContent = err.message; } }
+  }
+  function openClearLog(deviceId) {
+    FC.reset();
+    FC.device_id.innerHTML = S.devices.slice().sort((a, b) => a.name.localeCompare(b.name, "vi", { numeric: true }))
+      .map(d => `<option value="${d.id}">${esc(d.name)} (${esc(d.host)})</option>`).join("");
+    if (deviceId) { FC.mode.value = "device"; FC.device_id.value = String(deviceId); }
+    open("mClearLog"); clPreview();
+  }
+  FC.days.addEventListener("change", () => { FC.mode.value = "older"; });
+  FC.device_id.addEventListener("change", () => { FC.mode.value = "device"; });
+  FC.days.addEventListener("focus", () => { FC.mode.value = "older"; clPreview(); });
+  FC.device_id.addEventListener("focus", () => { FC.mode.value = "device"; clPreview(); });
+  FC.addEventListener("change", clPreview);
+  FC.onsubmit = async e => {
+    e.preventDefault();
+    const body = clBody();
+    const run = async () => { const j = await api("events/clear", body); toast("info", t("Đã xoá {0} sự kiện", j.deleted)); };
+    if (body.mode === "all") {
+      $("mClearLog").hidden = true;
+      confirmBox(t("Xoá toàn bộ nhật ký sự kiện?"),
+        t("Toàn bộ nhật ký sẽ bị xoá vĩnh viễn. Nên bấm <b>Xuất nhật ký CSV</b> để lưu lại trước."), true, run);
+      return;
+    }
+    try { await run(); close(FC); } catch (err) { $("clErr").textContent = err.message; }
+  };
+  $("clExport").onclick = () => { location.href = "api/events/export"; };
+  $("logClear").onclick = () => openClearLog();
+  // xoa tung su kien (nut ✕ khi tro chuot vao dong nhat ky)
+  $("events").addEventListener("mousedown", async e => {
+    const b = e.target.closest("[data-evdel]");
+    if (!b) return;
+    e.preventDefault(); e.stopPropagation();
+    b.disabled = true;
+    try { await api("events/clear", { mode: "ids", ids: [+b.dataset.evdel] }); }
+    catch (err) { toast("down", err.message); b.disabled = false; }
+  });
+  // trong o lich su da ghim: "Xoa nhat ky thiet bi nay"
+  $("hist").addEventListener("click", e => {
+    const a = e.target.closest("[data-clearhist]");
+    if (!a) return;
+    e.preventDefault();
+    const id = +a.dataset.clearhist; hideHist(); openClearLog(id);
+  });
 
   // ------------------------------------------------------------ kieu hien thi
   function applyView() {
@@ -2277,7 +2546,7 @@ DNS nội bộ, 10.10.90.2, Máy chủ, dns, cpt.gov.vn
     if (S && !document.querySelector(".modal:not([hidden])")) render();
   }, 1000);
   setInterval(poll, POLL_MS);
-  applyTheme(); applyView(); updSoundBtn();
+  applyTheme(); applyLog(); applyView(); updSoundBtn();
   poll();
 })();
 </script>
@@ -2285,63 +2554,6 @@ DNS nội bộ, 10.10.90.2, Máy chủ, dns, cpt.gov.vn
 </html>
 __PINGMON_EOF_2__
 ok 'app/index.html'
-
-cat > 'README.md' <<'__PINGMON_EOF_3__'
-# Website giám sát mạng nội bộ (pingmon)
-
-Máy chủ `awx` (10.10.90.183) · Thư mục `~/pingmon` · https://monitor.cpt.gov.vn
-
-## Tính năng
-- Giám sát **Ping**, **cổng TCP**, **web HTTP(S)**, **máy chủ DNS**.
-- Khi thiết bị **đổi trạng thái**, mọi trình duyệt đang mở trang sẽ:
-  - phát âm báo (tít‑tút khi **mất kết nối**, chuông đi lên khi **kết nối lại**),
-  - đọc tên thiết bị bằng giọng tiếng Việt (nếu máy có giọng Việt),
-  - hiện thông báo góc màn hình, ô thiết bị nháy viền, ghi nhật ký.
-- Ai cũng xem được; **thêm / sửa / xoá** cần đăng nhập quản trị.
-- Nhập hàng loạt (dán từ Excel hoặc dán nguyên kết quả quét mạng `IP  2 ms  HOSTNAME`), tuỳ chọn **xoá danh sách cũ rồi nhập mới**.
-- **Chọn nhiều** → xoá / tạm dừng / tiếp tục / chuyển nhóm hàng loạt; **Xoá tất cả** trong ⚙ Cài đặt.
-- Hai kiểu xem: **Ô** (chọn cỡ ô) và **Danh sách** (bảng, hiện đủ tên dài); xuất CSV; lọc theo nhóm / trạng thái / tìm kiếm.
-- 13 kiểu âm báo mất kết nối, 9 kiểu âm báo kết nối lại, hoặc **tệp âm thanh riêng** (mp3/wav ≤ 1,5 MB); chọn số lần lặp.
-- Trình duyệt mất kết nối tới máy chủ giám sát > 15 giây → báo vàng + âm cảnh báo.
-- **Giao diện Ngày / Đêm / Tự động** (nút 🌙 trên thanh tiêu đề; Tự động: ngày 6:00–18:00).
-- **Trỏ chuột vào tên thiết bị** → hiện nhật ký riêng của thiết bị: số lần mất kết nối, tổng thời gian mất,
-  % hoạt động trong 24 giờ / 7 ngày / 30 ngày, và từng lần mất kéo dài bao lâu. Bấm vào tên để ghim (dùng được trên điện thoại).
-
-## Lệnh
-```bash
-./installer            # cài đặt / cập nhật (giữ nguyên dữ liệu, mật khẩu, chứng chỉ)
-./installer status     # trạng thái
-./installer logs       # xem nhật ký (Ctrl+C để thoát)
-./installer password   # xem mật khẩu quản trị
-./installer uninstall  # dừng và gỡ container (giữ dữ liệu)
-```
-
-## Máy trực
-Mở https://monitor.cpt.gov.vn → bấm **"Bấm để bật âm thanh thông báo"** (một lần mỗi khi mở trình duyệt).
-
-Tự mở khi khởi động Windows, không cần bấm: tạo shortcut trong `shell:startup`:
-```
-"C:\Program Files\Google\Chrome\Application\chrome.exe" --kiosk --autoplay-policy=no-user-gesture-required https://monitor.cpt.gov.vn
-```
-Giọng đọc tiếng Việt trên Windows 10/11: **Cài đặt → Thời gian và ngôn ngữ → Giọng nói → Thêm giọng nói → Tiếng Việt** (Microsoft An), rồi mở lại Chrome.
-Nút **🔊 Âm thanh** trên trang: bật/tắt từng loại âm, chọn giọng, âm lượng, nhắc lại khi còn thiết bị mất kết nối.
-
-## Nhập danh sách
-Mỗi dòng: `Tên, IP, Nhóm, Loại, Cổng/URL/Tên miền` — chỉ cần `Tên, IP` (mặc định Ping).
-```
-Core Switch, 10.10.1.1, Lõi
-Web nội bộ, 10.10.90.10, Máy chủ, http, https://10.10.90.10/
-Remote Desktop, 10.10.90.20, Máy chủ, tcp, 3389
-DNS nội bộ, 10.10.90.2, Máy chủ, dns, cpt.gov.vn
-```
-
-## Ghi chú
-- Mặc định: kiểm tra mỗi 10 giây, báo mất kết nối sau 3 lần lỗi liên tiếp (~30 giây). Đổi trong **⚙ Cài đặt**.
-- HTTP được coi là hoạt động khi máy chủ trả mã < 500 (kể cả 401/403/404).
-- Dữ liệu: `~/pingmon/data/pingmon.db` (SQLite). Sao lưu: `cp ~/pingmon/data/pingmon.db ~/pingmon-$(date +%F).db`
-- Chứng chỉ cài lên máy trạm: `~/pingmon/pingmon.crt` (`certutil -addstore -f Root pingmon.crt`). Nếu đã cài `checkmate.crt` trước đó thì không cần cài lại — installer dùng lại cùng chứng chỉ.
-__PINGMON_EOF_3__
-ok 'README.md'
 
 # ---------------------------------------------------------------- 5. .env
 step "Cau hinh"
